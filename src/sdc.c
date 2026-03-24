@@ -37,6 +37,9 @@ static FATFS fs;
 static FIL fil[MAX_DRIVES+MAX_IMAGES+MAX_CORES];
 static DWORD *lktbl[MAX_DRIVES];
 
+// information about image data to be sent
+static uint32_t image_bytes2send[MAX_IMAGES];
+
 static void sdc_spi_begin(void) {
   mcu_hw_spi_begin();  
   mcu_hw_spi_tx_u08(SPI_TARGET_SDC);
@@ -368,7 +371,72 @@ static DWORD clmt_clust(FIL *fp, FSIZE_t ofs) {
 }
 #endif
 
-int sdc_handle_event(void) {  
+static void image_send_chunk(int image, uint32_t len) {  
+  
+  // send as many bytes as buffer space is available
+  if(!image_bytes2send[image]) {
+    sdc_debugf("IMG %d: no image to send!", image);
+    return;
+  }
+    
+  if(!fil[MAX_DRIVES+image].flag) {
+    sdc_debugf("IMG %d: no image to send!", image);
+    return;
+  }
+    
+  // send as many bytes as buffer space is available
+  if(!len) {
+    sdc_debugf("IMG %d: no data requested", image);
+    return;
+  }
+    
+  // don't send more bytes then left in file
+  if(len > image_bytes2send[image]) len = image_bytes2send[image];
+
+  // sdc_debugf("IMG %d: sending %d", image, len);
+
+  // read data from image file
+  unsigned char buffer[len];
+  UINT bytesread;
+  f_read(&fil[MAX_DRIVES+image], buffer, len, &bytesread);
+  
+  // send image payload
+  sdc_spi_begin();
+  mcu_hw_spi_tx_u08(SPI_SDC_IMAGE);
+  mcu_hw_spi_tx_u08(SPI_SDC_IMAGE_WRITE);  
+  mcu_hw_spi_tx_u08(image);
+  unsigned char *p = buffer;
+  while(len--) mcu_hw_spi_tx_u08(*p++);
+  mcu_hw_spi_end();
+  
+  image_bytes2send[image] -= len;
+}
+    
+static int sdc_rom_image_get_buffer(char image) {
+  sdc_spi_begin();
+  mcu_hw_spi_tx_u08(SPI_SDC_IMAGE);
+  mcu_hw_spi_tx_u08(SPI_SDC_IMAGE_STATUS);  
+  mcu_hw_spi_tx_u08(image);
+
+  uint8_t status = mcu_hw_spi_tx_u08(0);
+  
+  // read 16 bit buffer value
+  uint16_t buffer = mcu_hw_spi_tx_u08(0);
+  buffer = (buffer << 8) + mcu_hw_spi_tx_u08(0);
+  
+  mcu_hw_spi_end();
+
+  // return -1 if core has not accepted the image, e.g. since
+  // the size is not what it supports
+  if(!(status & 0x80))
+    return -1;
+  
+  return buffer;
+}
+
+int sdc_handle_event(void) {
+  bool handled = false;
+  
   // read sd status
   sdc_spi_begin();  
   mcu_hw_spi_tx_u08(SPI_SDC_STATUS);
@@ -421,9 +489,28 @@ int sdc_handle_event(void) {
     mcu_hw_spi_end();
 
     sdc_unlock();
+
+    handled = true;
+  } else {
+    // No SD RD/WR request bit set, check for image 
+
+    for(int i=0;i<8;i++) {
+      // Check if there's a running IMAGE transfer
+      int buffer = sdc_rom_image_get_buffer(i);
+      if(buffer > 0) {
+	image_send_chunk(i, buffer);
+	handled = true;
+      }
+    }
   }
 
-  return 0;
+#ifndef SDL
+  // in SDL emulation this is called from a timer and not from
+  // an actual interrupt
+  if(!handled) sdc_debugf("Warning, spourious interrupt");
+#endif
+  
+  return handled?0:-1;
 }
 
 static void sdc_image_enable_direct(char drive, unsigned long start) {
@@ -496,39 +583,6 @@ static void sdc_rom_image_selected(char image, FSIZE_t size) {
   mcu_hw_spi_tx_u08((size >> 8) & 0xff);
   mcu_hw_spi_tx_u08(size & 0xff);
 
-  mcu_hw_spi_end();
-}
-
-static int sdc_rom_image_get_buffer(char image) {
-  sdc_spi_begin();
-  mcu_hw_spi_tx_u08(SPI_SDC_IMAGE);
-  mcu_hw_spi_tx_u08(SPI_SDC_IMAGE_STATUS);  
-  mcu_hw_spi_tx_u08(image);
-
-  uint8_t status = mcu_hw_spi_tx_u08(0);
-  
-  // read 16 bit buffer value
-  uint16_t buffer = mcu_hw_spi_tx_u08(0);
-  buffer = (buffer << 8) + mcu_hw_spi_tx_u08(0);
-  
-  mcu_hw_spi_end();
-
-  // return -1 if core has not accepted the image, e.g. since
-  // the size is not what it supports
-  if(!(status & 0x80))
-    return -1;
-  
-  return buffer;
-}
-
-static void sdc_rom_image_send_chunk(char image, uint16_t len) {
-  sdc_spi_begin();
-  mcu_hw_spi_tx_u08(SPI_SDC_IMAGE);
-  mcu_hw_spi_tx_u08(SPI_SDC_IMAGE_WRITE);  
-  mcu_hw_spi_tx_u08(image);
-
-  while(len--) mcu_hw_spi_tx_u08(0);
-  
   mcu_hw_spi_end();
 }
 
@@ -654,25 +708,9 @@ int sdc_image_open(int drive, char *name) {
     // system while e.g. a slow tape upload is running
 
     // get number of bytes to send
-    uint32_t bytes2send = fil[drive].obj.objsize;
-    
-    // send as many bytes as buffer space is available
-    while(bytes2send) {
-      // request free buffer size
-      uint32_t cnt = sdc_rom_image_get_buffer(image);    
+    image_bytes2send[(int)image] = fil[drive].obj.objsize;
 
-      if(cnt) {
-	// don't send more bytes then left in file
-	if(cnt > bytes2send) cnt = bytes2send;
-      
-	sdc_rom_image_send_chunk(image, cnt);
-
-	bytes2send -= cnt;
-      } else {
-	// no buffer space available. Pause some time ...
-	vTaskDelay(pdMS_TO_TICKS(1));
-      }
-    }
+    image_send_chunk(image, sdc_rom_image_get_buffer(image));
     
     // remember current image name
     image_name[drive] = StrDup(name);    
@@ -867,7 +905,11 @@ int sdc_init(void) {
   for(int d=MAX_DRIVES+MAX_IMAGES;d<MAX_DRIVES+MAX_IMAGES+MAX_CORES;d++)
     cwd[d] = NULL;
 
-  return 0;
+  // no pending image transfers, yet
+  for(int d=0;d<MAX_IMAGES;d++)
+    image_bytes2send[d] = 0;
+
+ return 0;
 }
 
 void sdc_set_cwd(int drive, char *path) {
